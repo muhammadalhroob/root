@@ -1,10 +1,13 @@
 // Tests for the RooSimultaneous
 // Authors: Jonas Rembser, CERN  06/2021
 
+#include <Roo1DTable.h>
+#include <RooAddPdf.h>
 #include <RooAddition.h>
 #include <RooCategory.h>
 #include <RooConstVar.h>
 #include <RooDataSet.h>
+#include <RooExponential.h>
 #include <RooFitResult.h>
 #include <RooGenericPdf.h>
 #include <RooHelpers.h>
@@ -510,6 +513,51 @@ TEST_P(TestStatisticTest, RooSimultaneousSingleChannelCrossCheckWithCondVar)
       << "Inconsistency in RooSimultaneous wrapping with ConditionalObservables";
 }
 
+/// GitHub issue #18718.
+/// Make sure that we can do a ranged fit on an extended RooAddPdf in a
+/// RooSimultaneous with the new CPU backend.
+TEST(RooSimultaneous, RangedExtendedRooAddPdf)
+{
+
+   const double nBkgA_nom = 9000;
+   const double nBkgB_nom = 10000;
+
+   RooRealVar x("x", "Observable", 100, 150);
+   x.setRange("fitRange", 100, 130);
+
+   RooRealVar nBkgA("nBkgA", "", nBkgA_nom, 0.8 * nBkgA_nom, 1.2 * nBkgA_nom);
+   RooRealVar nBkgB("nBkgB", "", nBkgB_nom, 0.8 * nBkgB_nom, 1.2 * nBkgB_nom);
+
+   RooExponential expA("expA", "", x, RooFit::RooConst(-0.06));
+   RooAddPdf modelA("modelA", "", {expA}, {nBkgA});
+
+   RooExponential expB("expB", "", x, RooFit::RooConst(-0.09));
+   RooAddPdf modelB("modelB", "", {expB}, {nBkgB});
+
+   RooCategory runCat("runCat", "", {{"RunA", 0}, {"RunB", 1}});
+
+   RooSimultaneous simPdf("simPdf", "", {{"RunA", &modelA}, {"RunB", &modelB}}, runCat);
+
+   using namespace RooFit;
+
+   std::unique_ptr<RooDataSet> combData{simPdf.generate(RooArgSet(x, runCat), Extended())};
+
+   using Res = std::unique_ptr<RooFitResult>;
+
+   RooArgSet params;
+   RooArgSet paramsSnap;
+   simPdf.getParameters(combData->get(), params);
+   params.snapshot(paramsSnap);
+
+   Res fitResult{simPdf.fitTo(*combData, Save(), Range("fitRange"), EvalBackend(RooFit::EvalBackend::Cpu()))};
+
+   params.assign(paramsSnap);
+
+   Res fitResultRef{simPdf.fitTo(*combData, Save(), Range("fitRange"), EvalBackend(RooFit::EvalBackend::Legacy()))};
+
+   EXPECT_TRUE(fitResult->isIdentical(*fitResultRef));
+}
+
 /// GitHub issue #20383.
 /// Check that the the simultaneous pdf is normalized correctly when plotting
 /// with a projection dataset.
@@ -540,4 +588,36 @@ TEST(RooSimultaneous, PlotProjWData)
    // single bin and the model is uniform, to the curve should be equal to the
    // sum of data entries in the center.
    EXPECT_DOUBLE_EQ(frame->getCurve()->interpolate(0.), combData.sumEntries());
+}
+
+/// JIRA ticket https://its.cern.ch/jira/browse/ROOT-7499
+/// Check that we can also generate Asimov datasets with non-integer weights
+/// via RooSimultaneous.
+TEST(RooSimultaneous, ExpectedDataWithNonIntegerWeights)
+{
+
+   RooWorkspace ws{"ws"};
+   ws.factory("dummy_obs_a[0,1]");
+   ws.factory("dummy_obs_b[0,1]");
+   ws.factory("Uniform::uniform_a(dummy_obs_a)");
+   ws.factory("Uniform::uniform_b(dummy_obs_b)");
+   ws.factory("SUM::model_a(coeff_a[3.5]*uniform_a)");
+   ws.factory("SUM::model_b(coeff_b[6.5]*uniform_b)");
+
+   RooRealVar &dummy_obs_a = *ws.var("dummy_obs_a");
+   RooRealVar &dummy_obs_b = *ws.var("dummy_obs_b");
+
+   ws.factory("dummy_cat[a]");
+   ws.factory("SIMUL::sim_model(dummy_cat, a = model_a, b = model_b)");
+   RooAbsCategory &dummy_cat = *ws.cat("dummy_cat");
+
+   // std::cout << "simultaneous expected = " << ws.pdf("sim_model")->expectedEvents(dummy_obs) << std::endl;
+   RooDataSet *data = ws.pdf("sim_model")->generate({dummy_obs_a, dummy_obs_b, dummy_cat}, RooFit::ExpectedData());
+
+   std::unique_ptr<Roo1DTable> tab{data->table(dummy_cat)};
+
+   // Check that the sum of entries for each category is as expected, matching
+   // the coefficients from the RooAddPdf.
+   EXPECT_FLOAT_EQ(tab->get("a"), ws.var("coeff_a")->getVal());
+   EXPECT_FLOAT_EQ(tab->get("b"), ws.var("coeff_b")->getVal());
 }
